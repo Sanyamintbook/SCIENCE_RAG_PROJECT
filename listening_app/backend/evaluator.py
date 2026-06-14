@@ -1,159 +1,157 @@
-import requests
-import json
-import re
+"""
+evaluator.py
+============
+Scores how much of the audio a student actually understood — the way a teacher
+who holds the transcript would: by COVERAGE of the content.
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-# We use qwen2.5:3b or whatever model is currently pulled. 
-# The user mentioned having qwen2.5:3b and qwen2.5:7b. We'll use 3b for speed, 
-# or you can change it to 7b for better accuracy.
-MODEL_NAME = "qwen2.5:3b"
+How it works (all local, all in RAM):
+  1. The transcript is split into its individual sentences (key ideas). Each is
+     embedded into a vector once, when the assignment is created.
+  2. When a student submits, their answer is split into sentences and embedded.
+  3. For every transcript sentence we find the student's best-matching sentence
+     and award partial credit for how closely it matches (meaning, not wording).
+  4. The score is the AVERAGE credit across all transcript sentences — i.e. the
+     proportion of the audio's ideas the student captured. Skipping lines lowers
+     the score; an answer about a different topic scores near zero.
 
-def evaluate_answer(expected_answer: str, student_answer: str) -> dict:
-    """
-    Compares the student's answer against the expected answer semantically.
-    Returns a dictionary with 'score' (0-100) and 'feedback' (string).
-    """
-    
-    prompt = f"""You are a strict but fair teacher evaluating a student's listening comprehension answer.
-
-Teacher's Expected Answer: "{expected_answer}"
-Student's Answer: "{student_answer}"
-
-Task:
-1. Compare the MEANING of the student's answer to the expected answer. Do not punish for spelling or grammar mistakes if the meaning is correct.
-2. Give a Score from 0 to 100 based on how well the core concepts match.
-3. Provide exactly ONE sentence of constructive feedback.
-
-Format your response EXACTLY like this (and nothing else):
-Score: [number]
-Feedback: [your one sentence feedback]
+Spelling and wording are forgiven (embeddings match meaning). A spelling-tolerant
+lexical floor still guarantees an essentially complete copy scores ~100.
+Nothing is written to disk; every embedding request stays on localhost.
 """
 
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": prompt,
-        "stream": False,
-        "temperature": 0.1  # Low temperature for consistent grading
-    }
+import os
+import re
+from difflib import SequenceMatcher
 
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        response.raise_for_status()
-        result_text = response.json().get("response", "").strip()
-        
-        # Parse the output
-        score = 0
-        feedback = "Could not generate feedback."
-        
-        # Extract score using regex
-        score_match = re.search(r"Score:\s*(\d+)", result_text)
-        if score_match:
-            score = int(score_match.group(1))
-            
-        # Extract feedback using regex
-        feedback_match = re.search(r"Feedback:\s*(.+)", result_text, re.DOTALL)
-        if feedback_match:
-            feedback = feedback_match.group(1).strip()
-            
-        return {
-            "score": min(max(score, 0), 100), # Ensure it's between 0 and 100
-            "feedback": feedback
-        }
-        
-    except Exception as e:
-        print(f"Error evaluating answer: {e}")
-        return {
-            "score": 0,
-            "feedback": f"Error communicating with AI evaluator: {str(e)}"
-        }
-
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import requests
 
-# Load model once (global for performance)
-model = SentenceTransformer('all-MiniLM-L6-v2')
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+_EMBED_DIM = 768   # dimension of nomic-embed-text vectors
 
-def validate_text_accuracy(text1: str, text2: str, threshold: float = 0.75):
+# --- Per-sentence coverage calibration ---------------------------------------
+# A transcript sentence counts as fully "captured" once the best-matching
+# student sentence reaches HIGH_SIM; below LOW_SIM it counts as missed. In
+# between, partial credit is given. Tuned for nomic-embed-text sentence pairs:
+# a correct paraphrase scores ~0.75-0.9, an unrelated/missing line ~0.4-0.6.
+LOW_SIM = 0.70
+HIGH_SIM = 0.85
+
+# Auto-award full marks only for an essentially COMPLETE copy of the transcript.
+LEX_FULL_COPY = 0.95
+
+
+def get_embedding(text: str) -> np.ndarray:
+    """Convert text into a normalized vector via local Ollama (held only in RAM)."""
+    text = (text or "").strip()
+    if not text:
+        return np.zeros(_EMBED_DIM, dtype=np.float32)
+
+    response = requests.post(
+        f"{OLLAMA_HOST}/api/embeddings",
+        json={"model": EMBED_MODEL, "prompt": text},
+        timeout=120,
+    )
+    response.raise_for_status()
+    embedding = response.json().get("embedding", [])
+    if not embedding:
+        raise ValueError("Ollama returned an empty embedding.")
+
+    vec = np.array(embedding, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm else vec
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity between two vectors, in the range -1.0 .. 1.0."""
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def split_sentences(text: str) -> list:
+    """Split text into sentences on ., ?, ! — dropping trivially short fragments."""
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [p.strip() for p in parts if len(p.strip()) >= 3]
+
+
+def embed_sentences(text: str) -> list:
+    """Embed each sentence of a text into a vector (computed once per assignment)."""
+    return [get_embedding(s) for s in split_sentences(text)]
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, drop punctuation and collapse whitespace (for fuzzy matching)."""
+    text = (text or "").lower().strip()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _lexical_ratio(a: str, b: str) -> float:
+    """Spelling-tolerant character similarity on normalized text (0.0 .. 1.0)."""
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb:
+        return 0.0
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+def _sentence_credit(best_sim: float) -> float:
+    """Map a sentence's best match similarity to 0.0 .. 1.0 partial credit."""
+    norm = (best_sim - LOW_SIM) / (HIGH_SIM - LOW_SIM)
+    return max(0.0, min(1.0, norm))
+
+
+def _feedback_for(score: int) -> str:
+    if score >= 85:
+        return "Excellent! You captured almost all of the audio."
+    if score >= 70:
+        return "Good job — you captured most of the audio, but missed a few parts."
+    if score >= 50:
+        return "Fair — you captured about half of the audio; several ideas were missed."
+    if score >= 25:
+        return "Needs work — most of the audio's content was missed."
+    return "Very little of the audio was captured. Try listening again carefully."
+
+
+def score_dictation(
+    transcript_text: str,
+    transcript_sentence_vectors: list,
+    student_text: str,
+) -> dict:
     """
-    Compare two texts using FAISS embeddings and return similarity score + decision.
+    Score how much of the audio the student captured (0-100), by averaging
+    per-sentence coverage of the transcript. Wording and spelling are forgiven;
+    missing or wrong content lowers the score proportionally.
 
-    Args:
-        text1 (str): Reference text
-        text2 (str): Input text to validate
-        threshold (float): Similarity threshold (0 to 1)
-
-    Returns:
-        dict: {
-            "similarity_score": float,
-            "is_accurate": bool
-        }
+    Nothing is stored — every value is computed in memory and discarded.
     """
+    if not transcript_sentence_vectors:
+        return {"score": 0, "coverage": 0.0,
+                "feedback": "No transcript available to grade against."}
 
-    # Step 1: Generate embeddings
-    embeddings = model.encode([text1, text2])
-    
-    # Normalize for cosine similarity
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+    student_vectors = embed_sentences(student_text)
 
-    # Step 2: Create FAISS index (cosine similarity using Inner Product)
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
+    # For each transcript sentence, find the student's best-matching sentence
+    # and award partial credit; the score is the average across all sentences.
+    credits = []
+    for tvec in transcript_sentence_vectors:
+        best = max((cosine_similarity(tvec, svec) for svec in student_vectors),
+                   default=0.0)
+        credits.append(_sentence_credit(best))
+    coverage = sum(credits) / len(credits)
+    base = coverage * 100.0
 
-    # Step 3: Add reference embedding (text1)
-    index.add(np.array([embeddings[0]]).astype('float32'))
+    # Guarantee full marks for an essentially complete copy of the transcript.
+    if _lexical_ratio(transcript_text, student_text) >= LEX_FULL_COPY:
+        base = max(base, 100.0)
 
-    # Step 4: Search similarity for text2
-    D, I = index.search(np.array([embeddings[1]]).astype('float32'), k=1)
-
-    similarity_score = float(D[0][0])  # cosine similarity
-
-    # Step 5: Decision
-    is_accurate = similarity_score >= threshold
-
+    score = int(round(min(max(base, 0.0), 100.0)))
     return {
-        "similarity_score": round(similarity_score, 4),
-        "is_accurate": is_accurate
+        "score": score,
+        "coverage": round(coverage, 4),
+        "feedback": _feedback_for(score),
     }
-
-def evaluate_dictation(expected_transcript: str, student_dictation: str, threshold: float = 0.75) -> dict:
-    """
-    Wrapper function to use the user's provided FAISS validation logic.
-    Converts the output to the format expected by listening_api.py
-    """
-    try:
-        # Call the user's exact function
-        result = validate_text_accuracy(expected_transcript, student_dictation, threshold)
-        
-        print('validate_text_accuracy................');
-        
-        similarity = result["similarity_score"]
-        is_accurate = result["is_accurate"]
-        
-        # Convert 0-1 similarity to 0-100 score
-        score = int((similarity - 0.5) * (100 / 0.45))
-        score = min(max(score, 0), 100)
-        
-        if is_accurate:
-            score = 100
-            
-        if score == 100:
-            feedback = "Excellent dictation! Your understanding is highly accurate."
-        elif score >= 75:
-            feedback = "Good job! You captured most of the key concepts but missed a few words."
-        elif score >= 50:
-            feedback = "Fair attempt, but you missed a significant portion of the audio context."
-        else:
-            feedback = "Poor dictation. It seems you had trouble understanding the audio."
-            
-        return {
-            "score": score,
-            "feedback": f"{feedback} (Similarity score: {similarity})"
-        }
-        
-    except Exception as e:
-        print(f"Error in vector evaluation: {e}")
-        return {
-            "score": 0,
-            "feedback": f"Error using vector embeddings: {str(e)}"
-        }

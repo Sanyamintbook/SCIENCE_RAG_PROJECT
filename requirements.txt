@@ -17,6 +17,15 @@ scikit-learn       # TF-IDF + cosine similarity (peer copy check)
 numpy
 pandas             # teacher summary table
 
+# --- Listening app (RAM-only dictation scoring) ---
+# Versions pinned: newer ctranslate2 (>=4.5) segfaults on older CPUs / this box.
+faster-whisper==1.0.3   # local, offline speech-to-text (audio never leaves the machine)
+ctranslate2==4.4.0      # faster-whisper's engine; 4.4.0 is the last broadly-compatible build
+imageio-ffmpeg          # bundles an ffmpeg binary for in-memory audio decoding
+# NOTE: do NOT install torch in this venv — the broken torch build here raises an
+# OSError that slips past ctranslate2's import guard. faster-whisper runs torch-free.
+# embeddings for the understanding score reuse Ollama's nomic-embed-text (below)
+
 # --- RAG app (your existing science tutor) ---
 langchain-community
 langchain-text-splitters
@@ -26,6 +35,7 @@ langchain-core
 faiss-cpu
 tqdm
 
-# NOTE: No HuggingFace / sentence-transformers needed.
-# All AI goes through Ollama (qwen2.5:7b + nomic-embed-text), which you install
-# separately from https://ollama.com -- not via pip.
+# NOTE: The RAG + plagiarism apps use Ollama (qwen2.5 + nomic-embed-text),
+# installed separately from https://ollama.com -- not via pip.
+# The listening app is self-contained: faster-whisper + sentence-transformers
+# download small models on first use and then run fully offline.
